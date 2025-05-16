@@ -1,5 +1,6 @@
 import json
 import inspect
+import requests
 from isek.agent.persona import Persona
 from isek.util.logger import logger # Assuming logger has a standard logging interface
 from typing import List, Dict, Callable, Any, Optional, Union
@@ -12,24 +13,36 @@ class ToolBox:
     The ToolBox handles the registration of tools, storage of their metadata
     (like descriptions and schemas for LLM interaction), and the execution
     of tool calls based on requests from a language model.
+
+    It supports both direct function tools and MCP-based tools, allowing for
+    flexible and scalable tool management.
     """
-    def __init__(self, persona: Optional[Persona] = None) -> None:
+    def __init__(self, persona: Optional[Persona] = None, mcp_server_url: Optional[str] = None) -> None:
         """
         Initializes a ToolBox instance.
 
         :param persona: The persona of the agent that will be using these tools.
                         Used for logging purposes. Defaults to None.
         :type persona: typing.Optional[isek.agent.persona.Persona]
+        :param mcp_server_url: The base URL of the MCP server for dynamic tool discovery.
+                              Defaults to None.
+        :type mcp_server_url: typing.Optional[str]
         """
         self.logger = logger
         self.persona: Optional[Persona] = persona # Store persona for context in logging
+        self.mcp_server_url = mcp_server_url.rstrip('/') if mcp_server_url else None
 
         # Tool containers
         self.all_tools: Dict[str, Callable[..., Any]] = {} # Maps tool name to callable function
+        self.mcp_tools: Dict[str, Dict[str, Any]] = {} # Maps MCP tool name to its metadata
 
         # Tool metadata
         self.tool_descriptions: Dict[str, str] = {} # Maps tool name to its docstring
         self.tool_schemas: Dict[str, Dict[str, Any]] = {} # Maps tool name to its LLM-compatible schema
+
+        # Initialize MCP tools if server URL is provided
+        if self.mcp_server_url:
+            self._discover_mcp_tools()
 
     def _log(self, message: str) -> None:
         """
@@ -127,20 +140,14 @@ class ToolBox:
         """
         Executes a tool call based on an object from an LLM response.
 
-        The `tool_call` object is expected to have a `function.name` attribute
-        for the tool's name and a `function.arguments` attribute containing
-        a JSON string of arguments for the tool.
+        The method first checks if the tool is a direct function tool, then falls back
+        to checking if it's an MCP tool. If neither is found, returns an error message.
 
-        :param tool_call: The tool call object, typically from an LLM's response
-                          (e.g., OpenAI's tool_calls object). It should have
-                          `function.name` and `function.arguments` (as JSON string).
+        :param tool_call: The tool call object, typically from an LLM's response.
         :type tool_call: typing.Any
-        :param extra_kwargs: Additional keyword arguments to be passed to the
-                             tool function, merged with arguments from `tool_call`.
+        :param extra_kwargs: Additional keyword arguments to be passed to the tool function.
         :type extra_kwargs: typing.Any
         :return: A string representation of the tool's execution result.
-                 Returns an error message string if the tool is not found or
-                 if an error occurs during execution.
         :rtype: str
         """
         try:
@@ -150,14 +157,33 @@ class ToolBox:
             self._log(f"Error: {error_msg}")
             return error_msg
 
-        if name not in self.all_tools:
-            error_msg = f"Tool '{name}' not found."
-            self._log(f"Error: {error_msg}")
-            return error_msg
+        # Try direct function tool first
+        if name in self.all_tools:
+            return self._execute_direct_tool(name, tool_call, extra_kwargs)
+        
+        # Try MCP tool if available
+        if name in self.mcp_tools:
+            return self._execute_mcp_tool(name, tool_call, extra_kwargs)
+        
+        error_msg = f"Tool '{name}' not found in either direct tools or MCP tools."
+        self._log(f"Error: {error_msg}")
+        return error_msg
 
+    def _execute_direct_tool(self, name: str, tool_call: Any, extra_kwargs: Dict[str, Any]) -> str:
+        """
+        Executes a direct function tool.
+
+        :param name: The name of the tool to execute.
+        :type name: str
+        :param tool_call: The tool call object.
+        :type tool_call: typing.Any
+        :param extra_kwargs: Additional keyword arguments.
+        :type extra_kwargs: typing.Dict[str, typing.Any]
+        :return: The result of the tool execution.
+        :rtype: str
+        """
         func = self.all_tools[name]
         try:
-            # Ensure arguments is a string before trying to load JSON
             arguments_json = tool_call.function.arguments
             if not isinstance(arguments_json, str):
                 raise ValueError(f"Tool arguments for '{name}' must be a JSON string, got {type(arguments_json)}")
@@ -166,25 +192,102 @@ class ToolBox:
             if not isinstance(args_from_llm, dict):
                 raise ValueError(f"Parsed tool arguments for '{name}' must be a dictionary, got {type(args_from_llm)}")
 
-            # Merge LLM args with any extra_kwargs, extra_kwargs take precedence
             final_args = {**args_from_llm, **extra_kwargs}
-
-            self._log(f"Executing tool '{name}' with arguments: {final_args}")
+            self._log(f"Executing direct tool '{name}' with arguments: {final_args}")
             result = func(**final_args)
-            # Ensure result is stringifiable for consistent return type
             return str(result) if result is not None else "Tool executed successfully with no return value."
-        except json.JSONDecodeError as e:
-            error_msg = f"Error decoding JSON arguments for tool '{name}': {e}. Arguments: '{tool_call.function.arguments}'"
-            self._log(f"Error: {error_msg}")
-            return error_msg
-        except TypeError as e: # Catches issues with calling func (e.g. wrong number of args, unexpected args)
-            error_msg = f"Type error executing tool '{name}': {e}. Check tool signature and provided arguments."
-            self._log(f"Error: {error_msg}")
-            return error_msg
         except Exception as e:
-            error_msg = f"Unexpected error executing tool '{name}': {e}"
+            error_msg = f"Error executing direct tool '{name}': {e}"
             self._log(f"Error: {error_msg}")
             return error_msg
+
+    def _execute_mcp_tool(self, name: str, tool_call: Any, extra_kwargs: Dict[str, Any]) -> str:
+        """
+        Executes an MCP tool by making a request to the MCP server.
+
+        :param name: The name of the tool to execute.
+        :type name: str
+        :param tool_call: The tool call object.
+        :type tool_call: typing.Any
+        :param extra_kwargs: Additional keyword arguments.
+        :type extra_kwargs: typing.Dict[str, typing.Any]
+        :return: The result of the MCP tool execution.
+        :rtype: str
+        """
+        try:
+            arguments_json = tool_call.function.arguments
+            if not isinstance(arguments_json, str):
+                raise ValueError(f"Tool arguments for '{name}' must be a JSON string, got {type(arguments_json)}")
+
+            args_from_llm = json.loads(arguments_json)
+            if not isinstance(args_from_llm, dict):
+                raise ValueError(f"Parsed tool arguments for '{name}' must be a dictionary, got {type(args_from_llm)}")
+
+            final_args = {**args_from_llm, **extra_kwargs}
+            self._log(f"Executing MCP tool '{name}' with arguments: {final_args}")
+
+            response = requests.post(
+                f"{self.mcp_server_url}/execute/{name}",
+                json=final_args
+            )
+            response.raise_for_status()
+            result = response.json()
+            return str(result)
+        except Exception as e:
+            error_msg = f"Error executing MCP tool '{name}': {e}"
+            self._log(f"Error: {error_msg}")
+            return error_msg
+
+    def refresh_mcp_tools(self) -> None:
+        """
+        Refreshes the list of available MCP tools by querying the MCP server.
+        """
+        if self.mcp_server_url:
+            self._discover_mcp_tools()
+        else:
+            self._log("Cannot refresh MCP tools: No MCP server URL configured")
+
+    def _discover_mcp_tools(self) -> None:
+        """
+        Discovers available tools from the MCP server and caches their metadata.
+        """
+        try:
+            response = requests.get(f"{self.mcp_server_url}/tools")
+            response.raise_for_status()
+            tools = response.json()
+            
+            for tool in tools:
+                name = tool.get('name')
+                if name:
+                    self.mcp_tools[name] = tool
+                    self.tool_schemas[name] = self._mcp_tool_to_schema(tool)
+                    self.tool_descriptions[name] = tool.get('description', f'No description for MCP tool {name}')
+            
+            self._log(f"Discovered {len(self.mcp_tools)} tools from MCP server")
+        except Exception as e:
+            self._log(f"Error discovering MCP tools: {e}")
+
+    def _mcp_tool_to_schema(self, tool: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Converts an MCP tool definition into an LLM-compatible schema.
+
+        :param tool: The MCP tool definition.
+        :type tool: typing.Dict[str, typing.Any]
+        :return: The LLM-compatible schema for the tool.
+        :rtype: typing.Dict[str, typing.Any]
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": tool['name'],
+                "description": tool.get('description', f'No description for MCP tool {tool["name"]}'),
+                "parameters": {
+                    "type": "object",
+                    "properties": tool.get('parameters', {}),
+                    "required": tool.get('required', []),
+                },
+            },
+        }
 
     def _function_to_schema(self, func: Callable[..., Any]) -> Dict[str, Any]:
         """
@@ -275,6 +378,135 @@ class ToolBox:
                     "type": "object",
                     "properties": parameters_properties,
                     "required": required,
+                },
+            },
+        }
+    
+
+class Tool:
+    """Abstract base class for tools that can be used by agents."""
+    
+    @abstractmethod
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the JSON schema describing this tool."""
+        pass
+
+    @abstractmethod
+    def execute(self, *args, **kwargs) -> Any:
+        """Execute the tool with given arguments."""
+        pass
+
+
+class FunctionTool(Tool):
+    """Tool implementation that wraps a callable function."""
+
+    def __init__(self, func: Callable):
+        """Initialize with a callable function.
+        
+        Args:
+            func: The function to wrap as a tool
+        """
+        self.func = func
+        self._schema = self._build_schema()
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the JSON schema for the wrapped function."""
+        return self._schema
+
+    def execute(self, *args, **kwargs) -> Any:
+        """Execute the wrapped function."""
+        return self.func(*args, **kwargs)
+
+    def _build_schema(self) -> Dict[str, Any]:
+        """Build the JSON schema for the wrapped function."""
+        signature = inspect.signature(self.func)
+        # Reuse the schema building logic from above
+        parameters_properties: Dict[str, Dict[str, str]] = {}
+        for param in signature.parameters.values():
+            if param.name == 'self' and param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                continue
+            if param.kind == inspect.Parameter.VAR_POSITIONAL or param.kind == inspect.Parameter.VAR_KEYWORD:
+                continue
+
+            param_type_annotation = param.annotation
+            json_type = "string"
+
+            if hasattr(param_type_annotation, '__origin__') and param_type_annotation.__origin__ is Union:
+                args = [arg for arg in param_type_annotation.__args__ if arg is not type(None)]
+                if len(args) == 1:
+                    param_type_annotation = args[0]
+
+            if param_type_annotation is not inspect.Parameter.empty:
+                json_type = type_map.get(param_type_annotation, "string")
+            
+            param_description = f"Parameter '{param.name}' of type {param_type_annotation}"
+            if param.default != inspect.Parameter.empty:
+                param_description += f" (default: {param.default})"
+
+            parameters_properties[param.name] = {"type": json_type, "description": param_description}
+
+        required = [
+            param.name
+            for param in signature.parameters.values()
+            if param.default == inspect.Parameter.empty and
+               param.name != 'self' and
+               param.kind != inspect.Parameter.VAR_POSITIONAL and
+               param.kind != inspect.Parameter.VAR_KEYWORD
+        ]
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.func.__name__,
+                "description": (self.func.__doc__ or f"No description provided for tool {self.func.__name__}.").strip(),
+                "parameters": {
+                    "type": "object",
+                    "properties": parameters_properties,
+                    "required": required,
+                },
+            },
+        }
+
+
+class MCPTool(Tool):
+    """Tool implementation that wraps an MCP server endpoint."""
+
+    def __init__(self, server_url: str, endpoint: str, method: str = "POST"):
+        """Initialize with MCP server details.
+        
+        Args:
+            server_url: Base URL of the MCP server
+            endpoint: The endpoint to call
+            method: HTTP method to use (default: POST)
+        """
+        self.server_url = server_url.rstrip('/')
+        self.endpoint = endpoint.lstrip('/')
+        self.method = method
+        self._schema = self._build_schema()
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the JSON schema for the MCP endpoint."""
+        return self._schema
+
+    def execute(self, *args, **kwargs) -> Any:
+        """Execute the MCP endpoint call."""
+        url = f"{self.server_url}/{self.endpoint}"
+        response = requests.request(self.method, url, json=kwargs)
+        response.raise_for_status()
+        return response.json()
+
+    def _build_schema(self) -> Dict[str, Any]:
+        """Build the JSON schema for the MCP endpoint."""
+        # This could be enhanced to fetch schema from MCP server if available
+        return {
+            "type": "function",
+            "function": {
+                "name": self.endpoint,
+                "description": f"MCP endpoint {self.method} {self.endpoint}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},  # Could be populated from MCP server schema
+                    "required": [],
                 },
             },
         }
