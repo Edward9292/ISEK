@@ -1,17 +1,17 @@
 import json
 import inspect
+import asyncio
 from isek.agent.persona import Persona
-from isek.util.logger import logger # Assuming logger has a standard logging interface
+from isek.util.logger import logger
 from typing import List, Dict, Callable, Any, Optional, Union
-
+from isek.agent.tools.base import BaseTool, FunctionTool
+from isek.agent.tools.mcp_handler import MCPHandler
 
 class ToolBox:
     """
-    Manages a collection of tools (functions) that an agent can use.
-
-    The ToolBox handles the registration of tools, storage of their metadata
-    (like descriptions and schemas for LLM interaction), and the execution
-    of tool calls based on requests from a language model.
+    Manages a collection of tools that an agent can use.
+    Provides a unified interface for registering and executing both local function tools
+    and MCP server tools.
     """
     def __init__(self, persona: Optional[Persona] = None) -> None:
         """
@@ -22,14 +22,54 @@ class ToolBox:
         :type persona: typing.Optional[isek.agent.persona.Persona]
         """
         self.logger = logger
-        self.persona: Optional[Persona] = persona # Store persona for context in logging
+        self.persona: Optional[Persona] = persona
 
         # Tool containers
-        self.all_tools: Dict[str, Callable[..., Any]] = {} # Maps tool name to callable function
+        self.all_tools: Dict[str, BaseTool] = {}
+        
+        # MCP handler
+        self.mcp_handler: Optional[MCPHandler] = None
 
-        # Tool metadata
-        self.tool_descriptions: Dict[str, str] = {} # Maps tool name to its docstring
-        self.tool_schemas: Dict[str, Dict[str, Any]] = {} # Maps tool name to its LLM-compatible schema
+    async def register_tools(self, tools: Union[List[Union[Callable[..., Any], BaseTool]], str]) -> None:
+        """
+        Registers multiple tools at once. Can handle both local function tools and MCP server tools.
+
+        :param tools: Either:
+            - A list of callable functions or BaseTool instances for local tools
+            - A string path to an MCP server script (.py or .js) for MCP tools
+        :type tools: Union[List[Union[Callable[..., Any], BaseTool]], str]
+        """
+        if isinstance(tools, str):
+            # Handle MCP server tools
+            await self._register_mcp_tools(tools)
+        else:
+            # Handle local function tools
+            for tool in tools:
+                self.register_tool(tool)
+
+    async def _register_mcp_tools(self, server_script_path: str) -> None:
+        """
+        Register tools from an MCP server.
+
+        :param server_script_path: Path to the server script (.py or .js)
+        """
+        try:
+            # Initialize MCP handler if not already initialized
+            if not self.mcp_handler:
+                self.mcp_handler = MCPHandler()
+
+            # Connect to server and get tools
+            await self.mcp_handler.connect_to_server(server_script_path)
+            mcp_tools = await self.mcp_handler.get_available_tools()
+
+            # Register all MCP tools
+            for tool in mcp_tools:
+                self.register_tool(tool)
+            
+            self.logger.info(f"Registered MCP tools: {[tool.name for tool in mcp_tools]}")
+        except Exception as e:
+            self.logger.error(f"Failed to register MCP tools: {e}")
+            raise
 
     def _log(self, message: str) -> None:
         """
@@ -42,61 +82,34 @@ class ToolBox:
             prefix = f"[{self.persona.name}] " if self.persona else ""
             self.logger.info(f"{prefix}ToolBox: {message}")
 
-    def register_tool(self, func: Callable[..., Any]) -> None:
+    def register_tool(self, tool: Union[Callable[..., Any], BaseTool]) -> None:
         """
-        Registers a new callable function as a tool.
+        Registers a new tool.
 
-        The function's name is used as the tool name. Its docstring is
-        used as the description, and an LLM-compatible schema is generated
-        based on its signature and type annotations.
-
-        :param func: The function to register as a tool. It should have type hints
-                     for its parameters and a docstring for its description.
-        :type func: typing.Callable[..., typing.Any]
+        :param tool: Either a callable function or a BaseTool instance
+        :type tool: Union[Callable[..., Any], BaseTool]
         """
-        name = func.__name__
+        if isinstance(tool, BaseTool):
+            name = tool.name
+            tool_instance = tool
+        else:
+            name = tool.__name__
+            tool_instance = FunctionTool(tool)
 
         if name in self.all_tools:
             self._log(f"Warning: Tool '{name}' is being re-registered. Overwriting existing tool.")
 
-        # Store the function
-        self.all_tools[name] = func
-
-        # Generate and store the schema
-        try:
-            self.tool_schemas[name] = self._function_to_schema(func)
-        except (ValueError, KeyError) as e:
-            self._log(f"Error generating schema for tool '{name}': {e}. Tool not fully registered.")
-            # Optionally, decide if an incomplete registration is allowed or if it should raise
-            if name in self.all_tools: del self.all_tools[name] # Rollback
-            return
-
-        # Store metadata (docstring)
-        self.tool_descriptions[name] = (func.__doc__ or f"No description provided for tool {name}.").strip()
-
+        self.all_tools[name] = tool_instance
         self._log(f"Tool added: {name}")
 
-    def register_tools(self, tools: List[Callable[..., Any]]) -> None:
+    def get_tool(self, name: str) -> Optional[BaseTool]:
         """
-        Registers multiple tools at once.
-
-        Iterates through the provided list of functions and calls
-        :meth:`register_tool` for each one.
-
-        :param tools: A list of callable functions to register as tools.
-        :type tools: typing.List[typing.Callable[..., typing.Any]]
-        """
-        for tool in tools:
-            self.register_tool(tool)
-
-    def get_tool(self, name: str) -> Optional[Callable[..., Any]]:
-        """
-        Retrieves a registered tool function by its name.
+        Retrieves a registered tool by its name.
 
         :param name: The name of the tool to retrieve.
         :type name: str
-        :return: The callable tool function if found, otherwise `None`.
-        :rtype: typing.Optional[typing.Callable[..., typing.Any]]
+        :return: The tool if found, otherwise None.
+        :rtype: Optional[BaseTool]
         """
         return self.all_tools.get(name)
 
@@ -105,7 +118,7 @@ class ToolBox:
         Gets a list of names of all registered tools.
 
         :return: A list of tool names.
-        :rtype: typing.List[str]
+        :rtype: List[str]
         """
         return list(self.all_tools.keys())
 
@@ -113,34 +126,20 @@ class ToolBox:
         """
         Gets the LLM-compatible schemas for all registered tools.
 
-        .. note::
-            The original method had an optional `category` parameter which is not
-            used in the current implementation as tools are not categorized.
-            This docstring reflects the current signature.
-
-        :return: A list of tool schemas. Each schema is a dictionary.
-        :rtype: typing.List[typing.Dict[str, typing.Any]]
+        :return: A list of tool schemas.
+        :rtype: List[Dict[str, Any]]
         """
-        return [self.tool_schemas[name] for name in self.all_tools.keys() if name in self.tool_schemas]
+        return [tool.to_schema() for tool in self.all_tools.values()]
 
-    def execute_tool_call(self, tool_call: Any, **extra_kwargs: Any) -> str:
+    async def execute_tool_call_async(self, tool_call: Any, **extra_kwargs: Any) -> str:
         """
-        Executes a tool call based on an object from an LLM response.
-
-        The `tool_call` object is expected to have a `function.name` attribute
-        for the tool's name and a `function.arguments` attribute containing
-        a JSON string of arguments for the tool.
+        Executes a tool call based on an object from an LLM response asynchronously.
 
         :param tool_call: The tool call object, typically from an LLM's response
-                          (e.g., OpenAI's tool_calls object). It should have
-                          `function.name` and `function.arguments` (as JSON string).
-        :type tool_call: typing.Any
-        :param extra_kwargs: Additional keyword arguments to be passed to the
-                             tool function, merged with arguments from `tool_call`.
-        :type extra_kwargs: typing.Any
-        :return: A string representation of the tool's execution result.
-                 Returns an error message string if the tool is not found or
-                 if an error occurs during execution.
+        :type tool_call: Any
+        :param extra_kwargs: Additional keyword arguments to be passed to the tool
+        :type extra_kwargs: Any
+        :return: A string representation of the tool's execution result
         :rtype: str
         """
         try:
@@ -150,12 +149,12 @@ class ToolBox:
             self._log(f"Error: {error_msg}")
             return error_msg
 
-        if name not in self.all_tools:
+        tool = self.get_tool(name)
+        if not tool:
             error_msg = f"Tool '{name}' not found."
             self._log(f"Error: {error_msg}")
             return error_msg
 
-        func = self.all_tools[name]
         try:
             # Ensure arguments is a string before trying to load JSON
             arguments_json = tool_call.function.arguments
@@ -170,14 +169,20 @@ class ToolBox:
             final_args = {**args_from_llm, **extra_kwargs}
 
             self._log(f"Executing tool '{name}' with arguments: {final_args}")
-            result = func(**final_args)
+            
+            # Execute tool asynchronously if it supports it
+            if hasattr(tool, 'execute_async'):
+                result = await tool.execute_async(**final_args)
+            else:
+                result = tool.execute(**final_args)
+                
             # Ensure result is stringifiable for consistent return type
             return str(result) if result is not None else "Tool executed successfully with no return value."
         except json.JSONDecodeError as e:
             error_msg = f"Error decoding JSON arguments for tool '{name}': {e}. Arguments: '{tool_call.function.arguments}'"
             self._log(f"Error: {error_msg}")
             return error_msg
-        except TypeError as e: # Catches issues with calling func (e.g. wrong number of args, unexpected args)
+        except TypeError as e:
             error_msg = f"Type error executing tool '{name}': {e}. Check tool signature and provided arguments."
             self._log(f"Error: {error_msg}")
             return error_msg
@@ -186,95 +191,24 @@ class ToolBox:
             self._log(f"Error: {error_msg}")
             return error_msg
 
-    def _function_to_schema(self, func: Callable[..., Any]) -> Dict[str, Any]:
+    def execute_tool_call(self, tool_call: Any, **extra_kwargs: Any) -> str:
         """
-        Converts a Python function into an LLM-compatible tool schema.
+        Executes a tool call based on an object from an LLM response.
+        This is a synchronous wrapper around the async execution.
 
-        This schema typically follows a format similar to OpenAI's function calling
-        schema, detailing the function's name, description (from its docstring),
-        and parameters (derived from its signature and type annotations).
-
-        Supported Python types for parameters are mapped to JSON schema types:
-        `str` -> "string", `int` -> "integer", `float` -> "number",
-        `bool` -> "boolean", `list` -> "array", `dict` -> "object",
-        `NoneType` -> "null". Unannotated parameters or parameters with
-        unsupported annotations default to "string".
-
-        :param func: The callable function to convert.
-        :type func: typing.Callable[..., typing.Any]
-        :return: A dictionary representing the tool schema.
-        :rtype: typing.Dict[str, typing.Any]
-        :raises ValueError: If the function signature cannot be inspected or
-                            if a parameter's type annotation is of a type that
-                            cannot be directly mapped (and is not a common built-in).
-        :raises KeyError: If an internal error occurs mapping type annotations. (Less likely with defaults)
+        :param tool_call: The tool call object, typically from an LLM's response
+        :type tool_call: Any
+        :param extra_kwargs: Additional keyword arguments to be passed to the tool
+        :type extra_kwargs: Any
+        :return: A string representation of the tool's execution result
+        :rtype: str
         """
-        type_map = {
-            str: "string",
-            int: "integer",
-            float: "number",
-            bool: "boolean",
-            list: "array", # Note: This doesn't specify item types for the array.
-            dict: "object", # Note: This doesn't specify properties for the object.
-            type(None): "null",
-            # For Union types, one might pick the first non-NoneType, or handle more complexly.
-            # For Optional[X] (which is Union[X, NoneType]), this basic map won't inherently make it optional.
-            # The 'required' list handles whether a parameter is optional from a calling perspective.
-        }
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.execute_tool_call_async(tool_call, **extra_kwargs))
 
-        try:
-            signature = inspect.signature(func)
-        except ValueError as e: # e.g., for built-in functions in C
-            raise ValueError(
-                f"Failed to get signature for function '{func.__name__}': {e}"
-            )
-
-        parameters_properties: Dict[str, Dict[str, str]] = {}
-        for param in signature.parameters.values():
-            if param.name == 'self' and param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD: # Skip self for methods
-                continue
-            if param.kind == inspect.Parameter.VAR_POSITIONAL or param.kind == inspect.Parameter.VAR_KEYWORD: # Skip *args, **kwargs
-                continue
-
-            param_type_annotation = param.annotation
-            json_type = "string" # Default type
-
-            # Handle Optional[T] and Union[T, None]
-            if hasattr(param_type_annotation, '__origin__') and param_type_annotation.__origin__ is Union:
-                # Filter out NoneType for Optional fields
-                args = [arg for arg in param_type_annotation.__args__ if arg is not type(None)]
-                if len(args) == 1: # This was Optional[X] or Union[X, None]
-                    param_type_annotation = args[0]
-                # else: complex Union, default to string or handle as needed
-
-            if param_type_annotation is not inspect.Parameter.empty:
-                json_type = type_map.get(param_type_annotation, "string") # Default to string if type not in map
-            
-            # Basic description from annotation if possible, could be expanded
-            param_description = f"Parameter '{param.name}' of type {param_type_annotation}"
-            if param.default != inspect.Parameter.empty:
-                param_description += f" (default: {param.default})"
-
-            parameters_properties[param.name] = {"type": json_type, "description": param_description}
-
-        required = [
-            param.name
-            for param in signature.parameters.values()
-            if param.default == inspect.Parameter.empty and
-               param.name != 'self' and # Ensure self is not in required
-               param.kind != inspect.Parameter.VAR_POSITIONAL and # *args not required
-               param.kind != inspect.Parameter.VAR_KEYWORD # **kwargs not required
-        ]
-
-        return {
-            "type": "function",
-            "function": {
-                "name": func.__name__,
-                "description": (func.__doc__ or f"No description provided for tool {func.__name__}.").strip(),
-                "parameters": {
-                    "type": "object",
-                    "properties": parameters_properties,
-                    "required": required,
-                },
-            },
-        }
+    async def cleanup(self) -> None:
+        """
+        Clean up resources.
+        """
+        if self.mcp_handler:
+            await self.mcp_handler.cleanup()
