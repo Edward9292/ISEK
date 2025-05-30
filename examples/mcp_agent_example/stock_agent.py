@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 from isek.agent.single_agent import SingleAgent
 from isek.agent.persona import Persona
-from isek.agent.toolbox import ToolBox
 from isek.llm.openai_model import OpenAIModel
 from isek.agent.tools.mcp_handler import MCPHandler
 from dotenv import load_dotenv
